@@ -71,11 +71,12 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
         console.log("No record found. Initiating first chronicle...");
         await supabase.from('user_progress').upsert({
           user_id: user.id,
-          total_days: 15,
+          total_days: 0,
           history: [],
           missions: INITIAL_MISSIONS,
           completed_days: 0,
           retry_count: 0,
+          last_sealed_at: null,
           updated_at: new Date().toISOString()
         }, { onConflict: 'user_id' });
       }
@@ -113,8 +114,6 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
 
   // Auto-Failure Check & Cooldown Timer
   useEffect(() => {
-    if (!lastSealedAt) return;
-
     const checkStatus = () => {
       const now = new Date();
       const currentUTCHour = now.getUTCHours();
@@ -126,44 +125,41 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
       const isOpen = currentUTCHour >= 20 && currentUTCHour < 24;
       setIsWindowOpen(isOpen);
 
+      const pad = (n: number) => n.toString().padStart(2, '0');
+
       if (!isOpen) {
         // Calculate time until next window (20:00 UTC)
         const nextWindow = new Date();
         nextWindow.setUTCHours(20, 0, 0, 0);
-        // If we are past 00:00 but before 20:00, next window is today at 20:00.
-        // If we are theoretically past 24 (impossible with getUTCHours), handled correctly.
-
-        // If current hour is e.g. 01:00, next window is today 20:00.
-        // If current hour is e.g. 19:00, next window is one hour away.
-        // Simple check: if nextWindow is in the past (which shouldn't happen if we strictly follow 0-24, checking logic):
-        // Actually, if it's 21:00 it's open.
-        // If it's 02:00, nextWindow (20:00 today) is in future. +Ms positive.
-
-        // Edge case: ensure we are looking at the correct day?
-        // No, getUTCHours resets daily. So 20:00 today is always the target if we are < 20.
-        // Wait, correct.
-
         let diffWindow = nextWindow.getTime() - nowMs;
-        if (diffWindow < 0) {
-          // Should not happen if < 20 check is correct, but safe fallback: tomorrow 20:00
-          // This case implies we are supposedly "after" 20:00 but isOpen is false? 
-          // isOpen is false only if < 20 (since < 24 is always true for getUTCHours).
-          // So this branch is effectively for "future" 20:00.
 
-          // Actually, wait. If it is 23:59, isOpen is true.
-          // If it is 00:01, getUTCHours is 0. isOpen is false.
-          // nextWindow set to 20:00 TODAY.
-          // diff is ~20 hours. Correct.
+        // If we are past 00:00 but before 20:00, diff is positive.
+        // If it's 23:59 (isOpen would be true), we don't reach here.
+        if (diffWindow < 0) {
+          // Should not happen with < 20 check
         }
 
-        const wh = Math.floor(diffWindow / (1000 * 60 * 60));
-        const wm = Math.floor((diffWindow % (1000 * 60 * 60)) / (1000 * 60));
-        setTimeToWindow(`${wh}h ${wm}m`);
+        const h = Math.floor(diffWindow / (1000 * 60 * 60));
+        const m = Math.floor((diffWindow % (1000 * 60 * 60)) / (1000 * 60));
+        const s = Math.floor((diffWindow % (1000 * 60)) / 1000);
+        setTimeToWindow(`${pad(h)}:${pad(m)}:${pad(s)}`);
       } else {
-        setTimeToWindow(null);
+        // Calculate time until gate closes (00:00 UTC tomorrow)
+        const closeWindow = new Date();
+        closeWindow.setUTCHours(24, 0, 0, 0);
+        let diffClose = closeWindow.getTime() - nowMs;
+
+        const h = Math.floor(diffClose / (1000 * 60 * 60));
+        const m = Math.floor((diffClose % (1000 * 60 * 60)) / (1000 * 60));
+        const s = Math.floor((diffClose % (1000 * 60)) / 1000);
+        setTimeToWindow(`${pad(h)}:${pad(m)}:${pad(s)}`);
       }
 
-      if (!lastSealedAt) return;
+      if (!lastSealedAt) {
+        setTimeToNextSeal(null);
+        setIsTimerActive(false);
+        return;
+      }
       const hoursSinceLast = (nowMs - last) / (1000 * 60 * 60);
 
       // 1. Auto-Failure Check (> 48h implies missed 24h window)
@@ -233,7 +229,9 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
       if (diff > 0) {
         const h = Math.floor(diff / (1000 * 60 * 60));
         const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-        setTimeToNextSeal(`${h}h ${m}m`);
+        const s = Math.floor((diff % (1000 * 60)) / 1000);
+        const pad = (n: number) => n.toString().padStart(2, '0');
+        setTimeToNextSeal(`${pad(h)}:${pad(m)}:${pad(s)}`);
         setIsTimerActive(true);
       } else {
         setTimeToNextSeal(null);
@@ -242,7 +240,7 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
     };
 
     checkStatus();
-    const timer = setInterval(checkStatus, 60000); // Check every minute
+    const timer = setInterval(checkStatus, 1000); // Check every second
     return () => clearInterval(timer);
   }, [lastSealedAt, completedDays, retryCount, history, totalDays, user?.id]); // Added dependencies for punishment logic
 
@@ -860,26 +858,38 @@ const MadaraLanding: React.FC<MadaraLandingProps> = ({ user }) => {
           />
 
           <div className="mt-auto pt-6">
-            {(timeToNextSeal || !isWindowOpen) && (
-              <div className="text-center mb-2">
-                {timeToNextSeal ? (
-                  <span className="text-xs font-mono text-rose-500 animate-pulse">
-                    SEAL DORMANT. NEXT AWAKENING: {timeToNextSeal}
+            {/* Real-time Gate Countdown Viewer */}
+            <div className="text-center mb-6">
+              {timeToNextSeal ? (
+                <div className="flex flex-col items-center">
+                  <span className="text-xs font-mono text-rose-500 animate-pulse tracking-[0.3em] mb-2 uppercase">Chakra Dormant</span>
+                  <span className="text-3xl font-mono text-rose-600 drop-shadow-[0_0_10px_#e11d48] tabular-nums">
+                    {timeToNextSeal}
                   </span>
-                ) : (
-                  <div className="flex flex-col items-center">
-                    <span className="text-xs font-mono text-amber-500 animate-pulse">
-                      بوابة الختم تفتح فقط بتوقيت UTC (20:00 - 00:00)
+                </div>
+              ) : (
+                <div className="flex flex-col items-center px-6 py-4 bg-zinc-950/40 rounded-3xl border border-zinc-900/50 shadow-inner group">
+                  <span className={`text-[10px] font-bold uppercase tracking-[0.2em] mb-3 transition-colors duration-500 ${isWindowOpen ? 'text-rose-500' : 'text-amber-500'}`}>
+                    {isWindowOpen ? 'ستغلق البوابة خلال:' : 'تفتح بوابة الختم بعد:'}
+                  </span>
+                  <div className="relative">
+                    <span className={`text-4xl md:text-5xl font-mono tracking-wider tabular-nums transition-all duration-500 ${isWindowOpen ? 'text-rose-600 drop-shadow-[0_0_15px_#e11d48]' : 'text-amber-600 drop-shadow-[0_0_15px_#d97706]'}`}>
+                      {timeToWindow}
                     </span>
-                    {timeToWindow && (
-                      <span className="text-[10px] text-zinc-500 mt-1">
-                        Opens in: {timeToWindow}
-                      </span>
-                    )}
+                    <div className={`absolute -inset-2 blur-xl opacity-20 rounded-full transition-colors duration-500 ${isWindowOpen ? 'bg-rose-600' : 'bg-amber-600'}`} />
                   </div>
-                )}
-              </div>
-            )}
+                  {isWindowOpen && (
+                    <motion.span
+                      animate={{ opacity: [0.4, 1, 0.4] }}
+                      transition={{ duration: 2, repeat: Infinity }}
+                      className="text-[10px] text-zinc-500 mt-3 uppercase tracking-widest font-legendary italic bg-clip-text text-transparent bg-gradient-to-r from-zinc-500 via-rose-500 to-zinc-500"
+                    >
+                      أختم يومك الآن!
+                    </motion.span>
+                  )}
+                </div>
+              )}
+            </div>
 
             <button
               onClick={handleSealDay}
